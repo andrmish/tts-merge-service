@@ -9,7 +9,7 @@ const app = express();
 const upload = multer({ dest: os.tmpdir() });
 
 const SAMPLE_RATE = 44100;
-const CHANNELS = 1;
+const CHANNELS = 2;
 const CROSSFADE_SECONDS = 0.05;
 
 function runFfmpeg(args) {
