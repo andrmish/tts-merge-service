@@ -10,9 +10,10 @@ const upload = multer({ dest: os.tmpdir() });
 
 const SAMPLE_RATE = 44100;
 const CHANNELS = 2;
-const CROSSFADE_SECONDS = 0.05;
+const CROSSFADE_SECONDS = 0.04;
 
 function runFfmpeg(args) {
+  console.log("ffmpeg", args.join(" "));
   execFileSync("ffmpeg", args, { stdio: "inherit" });
 }
 
@@ -37,20 +38,29 @@ app.post("/merge", upload.array("files"), async (req, res) => {
       })
     );
 
+    console.log("Received files:", files.map(f => ({
+      originalname: f.originalname,
+      size: f.size,
+      mimetype: f.mimetype
+    })));
+
     const wavFiles = [];
 
     for (let i = 0; i < files.length; i++) {
       const input = files[i].path;
-      const wav = path.join(workDir, `part_${String(i + 1).padStart(4, "0")}.wav`);
+      const wav = path.join(
+        workDir,
+        `part_${String(i + 1).padStart(4, "0")}.wav`
+      );
 
+      // IMPORTANT: WAV/MP3 auto-detect. Do NOT force raw PCM here.
       runFfmpeg([
         "-y",
-        "-f", "s16le",
+        "-i", input,
         "-ar", String(SAMPLE_RATE),
         "-ac", String(CHANNELS),
-        "-i", input,
         "-af",
-        "silenceremove=start_periods=1:start_duration=0.03:start_threshold=-50dB:detection=peak,areverse,silenceremove=start_periods=1:start_duration=0.03:start_threshold=-50dB:detection=peak,areverse",
+        "silenceremove=start_periods=1:start_duration=0.02:start_threshold=-55dB:detection=peak,areverse,silenceremove=start_periods=1:start_duration=0.02:start_threshold=-55dB:detection=peak,areverse",
         wav
       ]);
 
@@ -61,7 +71,10 @@ app.post("/merge", upload.array("files"), async (req, res) => {
 
     for (let i = 1; i < wavFiles.length; i++) {
       const next = wavFiles[i];
-      const output = path.join(workDir, `merged_${String(i).padStart(4, "0")}.wav`);
+      const output = path.join(
+        workDir,
+        `merged_${String(i).padStart(4, "0")}.wav`
+      );
 
       runFfmpeg([
         "-y",
@@ -81,7 +94,7 @@ app.post("/merge", upload.array("files"), async (req, res) => {
       "-y",
       "-i", current,
       "-af",
-      "acompressor=threshold=-18dB:ratio=1.35:attack=20:release=120,loudnorm=I=-16:TP=-1.5:LRA=11",
+      "loudnorm=I=-16:TP=-1.5:LRA=11",
       "-codec:a", "libmp3lame",
       "-b:a", "192k",
       finalMp3
@@ -94,10 +107,12 @@ app.post("/merge", upload.array("files"), async (req, res) => {
     res.send(outputBuffer);
 
   } catch (err) {
-    console.error(err);
+    console.error("MERGE ERROR:", err);
+
     res.status(500).json({
       error: err.message
     });
+
   } finally {
     try {
       for (const file of req.files || []) {
