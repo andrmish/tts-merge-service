@@ -11,14 +11,21 @@ const upload = multer({ dest: os.tmpdir() });
 const SAMPLE_RATE = 44100;
 const CHANNELS = 1;
 
+// Пауза между уже очищенными фрагментами
 const GAP_SECONDS = 0.34;
-const FADE_SECONDS = 0.025;
 
-// Настройки поиска служебного intro
+// Мягкие края
+const FADE_SECONDS = 0.02;
+
+// Поиск служебной intro-паузы
 const INTRO_SEARCH_SECONDS = 12;
-const INTRO_SILENCE_MIN = 0.9;
-const INTRO_SILENCE_DB = "-35dB";
-const CUT_AFTER_SILENCE_PAD = 0.18;
+const INTRO_SILENCE_MIN = 0.75;
+const INTRO_SILENCE_DB = "-50dB";
+
+// ВАЖНО:
+// режем чуть ДО конца найденной паузы,
+// чтобы не съедать начало основного текста
+const CUT_BEFORE_SILENCE_END = 0.18;
 
 function runFfmpeg(args) {
   console.log("ffmpeg", args.join(" "));
@@ -39,13 +46,19 @@ function detectIntroCutTime(inputPath) {
     "-"
   ];
 
-  const result = spawnSync("ffmpeg", args, { encoding: "utf8" });
+  const result = spawnSync("ffmpeg", args, {
+    encoding: "utf8"
+  });
+
   const output = `${result.stdout || ""}\n${result.stderr || ""}`;
 
   console.log("silencedetect output:", output);
 
   const starts = [...output.matchAll(/silence_start:\s*([0-9.]+)/g)].map(m => Number(m[1]));
-  const ends = [...output.matchAll(/silence_end:\s*([0-9.]+)/g)].map(m => Number(m[1]));
+  const ends = [...output.matchAll(/silence_end:\s*([0-9.]+)\s*\|\s*silence_duration:\s*([0-9.]+)/g)].map(m => ({
+    end: Number(m[1]),
+    duration: Number(m[2])
+  }));
 
   if (!starts.length || !ends.length) {
     console.log("No intro silence detected. No trim.");
@@ -54,15 +67,22 @@ function detectIntroCutTime(inputPath) {
 
   for (let i = 0; i < Math.min(starts.length, ends.length); i++) {
     const silenceStart = starts[i];
-    const silenceEnd = ends[i];
+    const silenceEnd = ends[i].end;
+    const silenceDuration = ends[i].duration;
 
+    // Берём только настоящую длинную паузу после служебного intro
     if (
       silenceStart >= 1.0 &&
+      silenceStart <= 8.0 &&
       silenceEnd <= INTRO_SEARCH_SECONDS &&
-      silenceEnd > silenceStart
+      silenceDuration >= INTRO_SILENCE_MIN
     ) {
-      const cutTime = silenceEnd + CUT_AFTER_SILENCE_PAD;
-      console.log(`Intro cut detected: start=${silenceStart}, end=${silenceEnd}, cut=${cutTime}`);
+      const cutTime = Math.max(0, silenceEnd - CUT_BEFORE_SILENCE_END);
+
+      console.log(
+        `Intro cut detected: start=${silenceStart}, end=${silenceEnd}, duration=${silenceDuration}, cut=${cutTime}`
+      );
+
       return cutTime;
     }
   }
@@ -124,9 +144,10 @@ app.post("/merge", upload.array("files"), async (req, res) => {
         "-ac", String(CHANNELS),
         "-af",
         [
-          "silenceremove=start_periods=1:start_duration=0.05:start_threshold=-45dB:detection=peak",
+          // НЕ используем aggressive silenceremove в начале,
+          // чтобы не съедать первые тихие слова основного текста
           "loudnorm=I=-20:TP=-3:LRA=7",
-          "acompressor=threshold=-22dB:ratio=1.25:attack=25:release=180",
+          "acompressor=threshold=-22dB:ratio=1.2:attack=30:release=200",
           "alimiter=limit=0.90",
           `afade=t=in:st=0:d=${FADE_SECONDS}`,
           "areverse",
@@ -180,7 +201,7 @@ app.post("/merge", upload.array("files"), async (req, res) => {
       "-y",
       "-i", mergedWav,
       "-af",
-      "acompressor=threshold=-20dB:ratio=1.2:attack=30:release=220,loudnorm=I=-16:TP=-1.5:LRA=9,alimiter=limit=0.95",
+      "acompressor=threshold=-20dB:ratio=1.15:attack=35:release=240,loudnorm=I=-16:TP=-1.5:LRA=9,alimiter=limit=0.95",
       "-codec:a", "libmp3lame",
       "-b:a", "192k",
       finalMp3
