@@ -11,39 +11,35 @@ const upload = multer({ dest: os.tmpdir() });
 const SAMPLE_RATE = 44100;
 const CHANNELS = 1;
 
-// Так как после intro-обрезки мы оставляем часть служебной паузы,
-// внешнюю паузу между фрагментами делаем короче.
-const GAP_SECONDS = 0.22;
+// Пауза между очищенными фрагментами
+const GAP_SECONDS = 0.30;
 
-// Мягкий fade на краях, чтобы не было щелчков.
+// Мягкие края
 const FADE_SECONDS = 0.018;
 
-// Ожидаемая структура каждого файла:
-// [служебная фраза 5–7 сек] + [длинная пауза] + [основной текст]
+// Intro removal:
+// Ожидаем:
+// [Intonation bug removal test в первые 5 сек] + [пауза 1–1.5 сек] + [основной текст]
+const INTRO_SEARCH_SECONDS = 10.0;
 
-// Ищем длинную паузу только в начале файла.
-const INTRO_SEARCH_SECONDS = 13.0;
+// Ищем длинную паузу после служебной фразы.
+// Ставим окно шире, чтобы не промахнуться.
+const INTRO_SILENCE_START_MIN = 3.0;
+const INTRO_SILENCE_START_MAX = 8.5;
 
-// Пауза должна начинаться после служебной фразы.
-// Так мы не трогаем ранние микропаузы и не режем основной текст.
-const INTRO_SILENCE_START_MIN = 5.0;
-const INTRO_SILENCE_START_MAX = 9.5;
+// Пауза после intro почти 1–1.5 сек.
+// Но ставим 0.55, чтобы точно поймать даже если ElevenLabs сделал её короче.
+const INTRO_SILENCE_MIN = 0.55;
 
-// Минимальная длительность служебной паузы.
-const INTRO_SILENCE_MIN = 0.80;
-
-// Порог тишины.
-// Если пауза не находится, можно поднять до "-40dB".
-// Если находит слишком много ложных пауз, можно опустить до "-48dB".
-const INTRO_SILENCE_DB = "-44dB";
+// Порог делаем мягче, чтобы silence detect точно увидел паузу.
+const INTRO_SILENCE_DB = "-32dB";
 
 // Сколько тишины оставить перед основным текстом.
-// Это главный параметр защиты от обрезания первого слова.
-const KEEP_SILENCE_BEFORE_MAIN = 0.45;
+// Маленький запас, чтобы не съесть первое слово.
+const KEEP_SILENCE_BEFORE_MAIN = 0.12;
 
-// Чтобы не оставлять слишком длинную паузу,
-// мы можем войти внутрь найденной паузы минимум на 0.10 сек.
-const CUT_MIN_AFTER_SILENCE_START = 0.10;
+// Если пауза не найдена — всё равно гарантированно удаляем служебную фразу.
+const FALLBACK_CUT_SECONDS = 6.2;
 
 function runFfmpeg(args) {
   console.log("ffmpeg", args.join(" "));
@@ -99,6 +95,7 @@ function detectIntroCutTime(inputPath) {
 
   console.log("Parsed silence events:", silenceEvents);
 
+  // Берём первую длинную паузу после служебной фразы.
   const candidates = silenceEvents.filter(ev =>
     ev.start >= INTRO_SILENCE_START_MIN &&
     ev.start <= INTRO_SILENCE_START_MAX &&
@@ -106,46 +103,33 @@ function detectIntroCutTime(inputPath) {
     ev.end <= INTRO_SEARCH_SECONDS
   );
 
-  if (!candidates.length) {
-    console.log("No safe intro pause found. No trim to avoid cutting real text.");
-    return 0;
+  if (candidates.length > 0) {
+    // Берём самую раннюю подходящую паузу.
+    // Это должна быть пауза после "Intonation bug removal test".
+    candidates.sort((a, b) => a.start - b.start);
+
+    const introPause = candidates[0];
+
+    // Режем почти в конец паузы, но оставляем 0.12 сек перед основным текстом.
+    const cutTime = Math.max(
+      0,
+      introPause.end - KEEP_SILENCE_BEFORE_MAIN
+    );
+
+    console.log(
+      `Intro removed by silence: start=${introPause.start}, end=${introPause.end}, duration=${introPause.duration}, cut=${cutTime}`
+    );
+
+    return cutTime;
   }
 
-  // Берём самую длинную паузу в нужном окне.
-  // Это должна быть служебная пауза после intro.
-  candidates.sort((a, b) => b.duration - a.duration);
-  const introPause = candidates[0];
-
-  // Безопасная обрезка:
-  // 1. Удаляем служебную фразу.
-  // 2. Режем внутри тишины.
-  // 3. Оставляем часть тишины перед основным текстом.
-  //
-  // Например:
-  // pause start = 6.8
-  // pause end   = 8.0
-  // keep        = 0.45
-  // cut         = 7.55
-  //
-  // Основной текст начинается после 8.0,
-  // значит первые слова не съедаются.
-  const preferredCut = introPause.end - KEEP_SILENCE_BEFORE_MAIN;
-  const earliestSafeCut = introPause.start + CUT_MIN_AFTER_SILENCE_START;
-
-  const cutTime = Math.max(
-    0,
-    Math.max(earliestSafeCut, preferredCut)
-  );
-
-  // Дополнительная защита:
-  // никогда не режем после конца найденной паузы.
-  const safeCutTime = Math.min(cutTime, introPause.end - 0.05);
-
+  // Fallback: если тишина не распознана, гарантированно убираем первые 6.2 сек.
+  // Это лучше, чем оставить служебную фразу.
   console.log(
-    `Safe intro cut: start=${introPause.start}, end=${introPause.end}, duration=${introPause.duration}, cut=${safeCutTime}`
+    `No intro silence detected. Using fallback cut: ${FALLBACK_CUT_SECONDS}`
   );
 
-  return safeCutTime;
+  return FALLBACK_CUT_SECONDS;
 }
 
 app.get("/health", (req, res) => {
@@ -202,9 +186,7 @@ app.post("/merge", upload.array("files"), async (req, res) => {
         "-ac", String(CHANNELS),
         "-af",
         [
-          // ВАЖНО:
-          // Не используем silenceremove.
-          // Он может съедать первые тихие слова основного текста.
+          // Не используем silenceremove, чтобы не съедать первое слово основного текста.
           "loudnorm=I=-20:TP=-3:LRA=8",
           "acompressor=threshold=-22dB:ratio=1.15:attack=35:release=220",
           "alimiter=limit=0.92",
@@ -219,7 +201,6 @@ app.post("/merge", upload.array("files"), async (req, res) => {
       processedWavs.push(wav);
     }
 
-    // Создаём короткую нейтральную паузу между уже очищенными фрагментами.
     const gapWav = path.join(workDir, "gap.wav");
 
     runFfmpeg([
