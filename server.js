@@ -11,17 +11,14 @@ const upload = multer({ dest: os.tmpdir() });
 const SAMPLE_RATE = 44100;
 const CHANNELS = 1;
 
-// Пауза между уже очищенными фрагментами
 const GAP_SECONDS = 0.34;
-
-// Fade edges
 const FADE_SECONDS = 0.025;
 
-// Как искать длинную служебную паузу после intro
-const INTRO_SEARCH_SECONDS = 10;      // искать только в первых 10 сек файла
-const INTRO_SILENCE_MIN = 0.75;       // длинная пауза минимум 750 ms
-const INTRO_SILENCE_DB = "-38dB";     // чувствительность тишины
-const CUT_AFTER_SILENCE_PAD = 0.05;   // оставить 50 ms после конца паузы
+// Настройки поиска служебного intro
+const INTRO_SEARCH_SECONDS = 12;
+const INTRO_SILENCE_MIN = 0.9;
+const INTRO_SILENCE_DB = "-35dB";
+const CUT_AFTER_SILENCE_PAD = 0.18;
 
 function runFfmpeg(args) {
   console.log("ffmpeg", args.join(" "));
@@ -42,10 +39,7 @@ function detectIntroCutTime(inputPath) {
     "-"
   ];
 
-  const result = spawnSync("ffmpeg", args, {
-    encoding: "utf8"
-  });
-
+  const result = spawnSync("ffmpeg", args, { encoding: "utf8" });
   const output = `${result.stdout || ""}\n${result.stderr || ""}`;
 
   console.log("silencedetect output:", output);
@@ -62,7 +56,6 @@ function detectIntroCutTime(inputPath) {
     const silenceStart = starts[i];
     const silenceEnd = ends[i];
 
-    // Нам нужна пауза после служебного intro, а не микропауза в самом начале
     if (
       silenceStart >= 1.0 &&
       silenceEnd <= INTRO_SEARCH_SECONDS &&
@@ -131,6 +124,7 @@ app.post("/merge", upload.array("files"), async (req, res) => {
         "-ac", String(CHANNELS),
         "-af",
         [
+          "silenceremove=start_periods=1:start_duration=0.05:start_threshold=-45dB:detection=peak",
           "loudnorm=I=-20:TP=-3:LRA=7",
           "acompressor=threshold=-22dB:ratio=1.25:attack=25:release=180",
           "alimiter=limit=0.90",
