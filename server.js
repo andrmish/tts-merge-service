@@ -10,11 +10,18 @@ const upload = multer({ dest: os.tmpdir() });
 
 const SAMPLE_RATE = 44100;
 const CHANNELS = 1;
-const CROSSFADE_SECONDS = 0.04;
+
+// Главное место для настройки пауз
+const GAP_SECONDS = 0.30;      // 300 ms между фрагментами
+const FADE_SECONDS = 0.015;    // 15 ms микро fade-in / fade-out
 
 function runFfmpeg(args) {
   console.log("ffmpeg", args.join(" "));
   execFileSync("ffmpeg", args, { stdio: "inherit" });
+}
+
+function escapeConcatPath(filePath) {
+  return filePath.replace(/'/g, "'\\''");
 }
 
 app.get("/health", (req, res) => {
@@ -47,11 +54,10 @@ app.post("/merge", upload.array("files"), async (req, res) => {
       }))
     );
 
-    const wavFiles = [];
+    const processedWavs = [];
 
-    // Convert every input file to clean WAV.
-    // Important: DO NOT use "-f s16le" here.
-    // Input is already WAV, so ffmpeg must auto-detect it via "-i".
+    // 1. Convert every input WAV to clean mono WAV
+    //    and add tiny fade-in / fade-out to hide hard edges.
     for (let i = 0; i < files.length; i++) {
       const input = files[i].path;
       const wav = path.join(
@@ -64,41 +70,60 @@ app.post("/merge", upload.array("files"), async (req, res) => {
         "-i", input,
         "-ar", String(SAMPLE_RATE),
         "-ac", String(CHANNELS),
+        "-af",
+        `afade=t=in:st=0:d=${FADE_SECONDS},areverse,afade=t=in:st=0:d=${FADE_SECONDS},areverse`,
         wav
       ]);
 
-      wavFiles.push(wav);
+      processedWavs.push(wav);
     }
 
-    let current = wavFiles[0];
+    // 2. Create neutral silence gap
+    const gapWav = path.join(workDir, "gap.wav");
 
-    // Sequential crossfade merge
-    for (let i = 1; i < wavFiles.length; i++) {
-      const next = wavFiles[i];
-      const output = path.join(
-        workDir,
-        `merged_${String(i).padStart(4, "0")}.wav`
-      );
-
-      runFfmpeg([
-        "-y",
-        "-i", current,
-        "-i", next,
-        "-filter_complex",
-        `[0:a][1:a]acrossfade=d=${CROSSFADE_SECONDS}:c1=exp:c2=exp`,
-        output
-      ]);
-
-      current = output;
-    }
-
-    const finalMp3 = path.join(workDir, "final.mp3");
-
-    // Final MP3 export.
-    // No compressor here because Auphonic will do final mastering.
     runFfmpeg([
       "-y",
-      "-i", current,
+      "-f", "lavfi",
+      "-i", `anullsrc=r=${SAMPLE_RATE}:cl=mono:d=${GAP_SECONDS}`,
+      "-ar", String(SAMPLE_RATE),
+      "-ac", String(CHANNELS),
+      gapWav
+    ]);
+
+    // 3. Build concat list:
+    //    part1 + gap + part2 + gap + part3...
+    const concatListPath = path.join(workDir, "concat.txt");
+
+    const concatLines = [];
+
+    for (let i = 0; i < processedWavs.length; i++) {
+      concatLines.push(`file '${escapeConcatPath(processedWavs[i])}'`);
+
+      if (i < processedWavs.length - 1) {
+        concatLines.push(`file '${escapeConcatPath(gapWav)}'`);
+      }
+    }
+
+    fs.writeFileSync(concatListPath, concatLines.join("\n"));
+
+    const mergedWav = path.join(workDir, "merged.wav");
+
+    runFfmpeg([
+      "-y",
+      "-f", "concat",
+      "-safe", "0",
+      "-i", concatListPath,
+      "-c", "copy",
+      mergedWav
+    ]);
+
+    // 4. Final MP3 export.
+    //    No compressor here because Auphonic will do final mastering.
+    const finalMp3 = path.join(workDir, "final.mp3");
+
+    runFfmpeg([
+      "-y",
+      "-i", mergedWav,
       "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
       "-codec:a", "libmp3lame",
       "-b:a", "192k",
