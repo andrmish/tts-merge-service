@@ -17,29 +17,27 @@ const GAP_SECONDS = 0.30;
 // Мягкие края
 const FADE_SECONDS = 0.018;
 
-// Intro removal:
-// Ожидаем:
-// [Intonation bug removal test в первые 5 сек] + [пауза 1–1.5 сек] + [основной текст]
-const INTRO_SEARCH_SECONDS = 10.0;
+// Ожидаемая структура:
+// [Intonation bug removal test] + [первая длинная пауза в первые 5 сек] + [основной текст]
 
-// Ищем длинную паузу после служебной фразы.
-// Ставим окно шире, чтобы не промахнуться.
-const INTRO_SILENCE_START_MIN = 3.0;
-const INTRO_SILENCE_START_MAX = 8.5;
+// Анализируем только первые 7 секунд, чтобы поймать конец паузы,
+// но сама пауза должна НАЧАТЬСЯ в первые 5 секунд.
+const INTRO_SEARCH_SECONDS = 7.0;
 
-// Пауза после intro почти 1–1.5 сек.
-// Но ставим 0.55, чтобы точно поймать даже если ElevenLabs сделал её короче.
-const INTRO_SILENCE_MIN = 0.55;
+// Ищем первую длинную паузу, начавшуюся в первые 5 секунд
+const INTRO_PAUSE_START_MAX = 5.0;
 
-// Порог делаем мягче, чтобы silence detect точно увидел паузу.
-const INTRO_SILENCE_DB = "-32dB";
+// Минимальная длительность паузы.
+// Если ElevenLabs делает паузу 1–1.5 сек, 0.45 безопасно.
+const INTRO_SILENCE_MIN = 0.45;
+
+// Порог тишины. 
+// -38dB обычно хорошо ловит TTS-паузу, но не ловит тихие согласные как silence.
+const INTRO_SILENCE_DB = "-38dB";
 
 // Сколько тишины оставить перед основным текстом.
-// Маленький запас, чтобы не съесть первое слово.
-const KEEP_SILENCE_BEFORE_MAIN = 0.12;
-
-// Если пауза не найдена — всё равно гарантированно удаляем служебную фразу.
-const FALLBACK_CUT_SECONDS = 6.2;
+// Это защищает от обрезания первого слова.
+const KEEP_SILENCE_BEFORE_MAIN = 0.22;
 
 function runFfmpeg(args) {
   console.log("ffmpeg", args.join(" "));
@@ -95,41 +93,30 @@ function detectIntroCutTime(inputPath) {
 
   console.log("Parsed silence events:", silenceEvents);
 
-  // Берём первую длинную паузу после служебной фразы.
-  const candidates = silenceEvents.filter(ev =>
-    ev.start >= INTRO_SILENCE_START_MIN &&
-    ev.start <= INTRO_SILENCE_START_MAX &&
-    ev.duration >= INTRO_SILENCE_MIN &&
-    ev.end <= INTRO_SEARCH_SECONDS
+  // Берём ПЕРВУЮ подходящую паузу, которая началась в первые 5 секунд.
+  const firstIntroPause = silenceEvents.find(ev =>
+    ev.start > 0.20 &&
+    ev.start <= INTRO_PAUSE_START_MAX &&
+    ev.duration >= INTRO_SILENCE_MIN
   );
 
-  if (candidates.length > 0) {
-    // Берём самую раннюю подходящую паузу.
-    // Это должна быть пауза после "Intonation bug removal test".
-    candidates.sort((a, b) => a.start - b.start);
-
-    const introPause = candidates[0];
-
-    // Режем почти в конец паузы, но оставляем 0.12 сек перед основным текстом.
-    const cutTime = Math.max(
-      0,
-      introPause.end - KEEP_SILENCE_BEFORE_MAIN
-    );
-
-    console.log(
-      `Intro removed by silence: start=${introPause.start}, end=${introPause.end}, duration=${introPause.duration}, cut=${cutTime}`
-    );
-
-    return cutTime;
+  if (!firstIntroPause) {
+    console.log("No intro pause found in first 5 seconds. No trim.");
+    return 0;
   }
 
-  // Fallback: если тишина не распознана, гарантированно убираем первые 6.2 сек.
-  // Это лучше, чем оставить служебную фразу.
-  console.log(
-    `No intro silence detected. Using fallback cut: ${FALLBACK_CUT_SECONDS}`
+  // Режем почти в конец этой паузы, но оставляем небольшой кусок тишины
+  // перед основным текстом, чтобы не съесть первое слово.
+  const cutTime = Math.max(
+    0,
+    firstIntroPause.end - KEEP_SILENCE_BEFORE_MAIN
   );
 
-  return FALLBACK_CUT_SECONDS;
+  console.log(
+    `Intro cut by FIRST pause in first 5 sec: start=${firstIntroPause.start}, end=${firstIntroPause.end}, duration=${firstIntroPause.duration}, cut=${cutTime}`
+  );
+
+  return cutTime;
 }
 
 app.get("/health", (req, res) => {
@@ -186,7 +173,7 @@ app.post("/merge", upload.array("files"), async (req, res) => {
         "-ac", String(CHANNELS),
         "-af",
         [
-          // Не используем silenceremove, чтобы не съедать первое слово основного текста.
+          // НЕ используем silenceremove, чтобы не съедать начало основного текста
           "loudnorm=I=-20:TP=-3:LRA=8",
           "acompressor=threshold=-22dB:ratio=1.15:attack=35:release=220",
           "alimiter=limit=0.92",
