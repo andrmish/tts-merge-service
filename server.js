@@ -9,7 +9,7 @@ const app = express();
 const upload = multer({ dest: os.tmpdir() });
 
 const SAMPLE_RATE = 44100;
-const CHANNELS = 2;
+const CHANNELS = 1;
 const CROSSFADE_SECONDS = 0.04;
 
 function runFfmpeg(args) {
@@ -38,14 +38,20 @@ app.post("/merge", upload.array("files"), async (req, res) => {
       })
     );
 
-    console.log("Received files:", files.map(f => ({
-      originalname: f.originalname,
-      size: f.size,
-      mimetype: f.mimetype
-    })));
+    console.log(
+      "Received files:",
+      files.map(f => ({
+        originalname: f.originalname,
+        size: f.size,
+        mimetype: f.mimetype
+      }))
+    );
 
     const wavFiles = [];
 
+    // Convert every input file to clean WAV.
+    // Important: DO NOT use "-f s16le" here.
+    // Input is already WAV, so ffmpeg must auto-detect it via "-i".
     for (let i = 0; i < files.length; i++) {
       const input = files[i].path;
       const wav = path.join(
@@ -53,14 +59,11 @@ app.post("/merge", upload.array("files"), async (req, res) => {
         `part_${String(i + 1).padStart(4, "0")}.wav`
       );
 
-      // IMPORTANT: WAV/MP3 auto-detect. Do NOT force raw PCM here.
       runFfmpeg([
         "-y",
         "-i", input,
         "-ar", String(SAMPLE_RATE),
         "-ac", String(CHANNELS),
-        "-af",
-        "silenceremove=start_periods=1:start_duration=0.02:start_threshold=-55dB:detection=peak,areverse,silenceremove=start_periods=1:start_duration=0.02:start_threshold=-55dB:detection=peak,areverse",
         wav
       ]);
 
@@ -69,6 +72,7 @@ app.post("/merge", upload.array("files"), async (req, res) => {
 
     let current = wavFiles[0];
 
+    // Sequential crossfade merge
     for (let i = 1; i < wavFiles.length; i++) {
       const next = wavFiles[i];
       const output = path.join(
@@ -90,11 +94,12 @@ app.post("/merge", upload.array("files"), async (req, res) => {
 
     const finalMp3 = path.join(workDir, "final.mp3");
 
+    // Final MP3 export.
+    // No compressor here because Auphonic will do final mastering.
     runFfmpeg([
       "-y",
       "-i", current,
-      "-af",
-      "loudnorm=I=-16:TP=-1.5:LRA=11",
+      "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
       "-codec:a", "libmp3lame",
       "-b:a", "192k",
       finalMp3
