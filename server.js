@@ -11,9 +11,9 @@ const upload = multer({ dest: os.tmpdir() });
 const SAMPLE_RATE = 44100;
 const CHANNELS = 1;
 
-// Главное место для настройки пауз
-const GAP_SECONDS = 0.30;      // 300 ms между фрагментами
-const FADE_SECONDS = 0.015;    // 15 ms микро fade-in / fade-out
+// Настройки стыков
+const GAP_SECONDS = 0.34;      // пауза между фрагментами
+const FADE_SECONDS = 0.025;    // мягкий fade-in / fade-out
 
 function runFfmpeg(args) {
   console.log("ffmpeg", args.join(" "));
@@ -56,10 +56,11 @@ app.post("/merge", upload.array("files"), async (req, res) => {
 
     const processedWavs = [];
 
-    // 1. Convert every input WAV to clean mono WAV
-    //    and add tiny fade-in / fade-out to hide hard edges.
+    // 1. Каждый входной WAV приводим к единому виду:
+    // mono 44100, выравнивание громкости, мягкая динамика, fade edges.
     for (let i = 0; i < files.length; i++) {
       const input = files[i].path;
+
       const wav = path.join(
         workDir,
         `part_${String(i + 1).padStart(4, "0")}.wav`
@@ -71,14 +72,22 @@ app.post("/merge", upload.array("files"), async (req, res) => {
         "-ar", String(SAMPLE_RATE),
         "-ac", String(CHANNELS),
         "-af",
-        `afade=t=in:st=0:d=${FADE_SECONDS},areverse,afade=t=in:st=0:d=${FADE_SECONDS},areverse`,
+        [
+          "loudnorm=I=-20:TP=-3:LRA=7",
+          "acompressor=threshold=-22dB:ratio=1.25:attack=25:release=180",
+          "alimiter=limit=0.90",
+          `afade=t=in:st=0:d=${FADE_SECONDS}`,
+          "areverse",
+          `afade=t=in:st=0:d=${FADE_SECONDS}`,
+          "areverse"
+        ].join(","),
         wav
       ]);
 
       processedWavs.push(wav);
     }
 
-    // 2. Create neutral silence gap
+    // 2. Создаём нейтральную паузу между фрагментами
     const gapWav = path.join(workDir, "gap.wav");
 
     runFfmpeg([
@@ -90,10 +99,9 @@ app.post("/merge", upload.array("files"), async (req, res) => {
       gapWav
     ]);
 
-    // 3. Build concat list:
-    //    part1 + gap + part2 + gap + part3...
+    // 3. Собираем concat list:
+    // part1 + gap + part2 + gap + part3...
     const concatListPath = path.join(workDir, "concat.txt");
-
     const concatLines = [];
 
     for (let i = 0; i < processedWavs.length; i++) {
@@ -117,14 +125,14 @@ app.post("/merge", upload.array("files"), async (req, res) => {
       mergedWav
     ]);
 
-    // 4. Final MP3 export.
-    //    No compressor here because Auphonic will do final mastering.
+    // 4. Финальный MP3 export
     const finalMp3 = path.join(workDir, "final.mp3");
 
     runFfmpeg([
       "-y",
       "-i", mergedWav,
-      "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+      "-af",
+      "acompressor=threshold=-20dB:ratio=1.2:attack=30:release=220,loudnorm=I=-16:TP=-1.5:LRA=9,alimiter=limit=0.95",
       "-codec:a", "libmp3lame",
       "-b:a", "192k",
       finalMp3
