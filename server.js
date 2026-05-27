@@ -3,7 +3,7 @@ import multer from "multer";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { execFileSync } from "child_process";
+import { execFileSync, spawnSync } from "child_process";
 
 const app = express();
 const upload = multer({ dest: os.tmpdir() });
@@ -11,9 +11,17 @@ const upload = multer({ dest: os.tmpdir() });
 const SAMPLE_RATE = 44100;
 const CHANNELS = 1;
 
-// Настройки стыков
-const GAP_SECONDS = 0.34;      // пауза между фрагментами
-const FADE_SECONDS = 0.025;    // мягкий fade-in / fade-out
+// Пауза между уже очищенными фрагментами
+const GAP_SECONDS = 0.34;
+
+// Fade edges
+const FADE_SECONDS = 0.025;
+
+// Как искать длинную служебную паузу после intro
+const INTRO_SEARCH_SECONDS = 10;      // искать только в первых 10 сек файла
+const INTRO_SILENCE_MIN = 0.75;       // длинная пауза минимум 750 ms
+const INTRO_SILENCE_DB = "-38dB";     // чувствительность тишины
+const CUT_AFTER_SILENCE_PAD = 0.05;   // оставить 50 ms после конца паузы
 
 function runFfmpeg(args) {
   console.log("ffmpeg", args.join(" "));
@@ -22,6 +30,52 @@ function runFfmpeg(args) {
 
 function escapeConcatPath(filePath) {
   return filePath.replace(/'/g, "'\\''");
+}
+
+function detectIntroCutTime(inputPath) {
+  const args = [
+    "-hide_banner",
+    "-t", String(INTRO_SEARCH_SECONDS),
+    "-i", inputPath,
+    "-af", `silencedetect=noise=${INTRO_SILENCE_DB}:d=${INTRO_SILENCE_MIN}`,
+    "-f", "null",
+    "-"
+  ];
+
+  const result = spawnSync("ffmpeg", args, {
+    encoding: "utf8"
+  });
+
+  const output = `${result.stdout || ""}\n${result.stderr || ""}`;
+
+  console.log("silencedetect output:", output);
+
+  const starts = [...output.matchAll(/silence_start:\s*([0-9.]+)/g)].map(m => Number(m[1]));
+  const ends = [...output.matchAll(/silence_end:\s*([0-9.]+)/g)].map(m => Number(m[1]));
+
+  if (!starts.length || !ends.length) {
+    console.log("No intro silence detected. No trim.");
+    return 0;
+  }
+
+  for (let i = 0; i < Math.min(starts.length, ends.length); i++) {
+    const silenceStart = starts[i];
+    const silenceEnd = ends[i];
+
+    // Нам нужна пауза после служебного intro, а не микропауза в самом начале
+    if (
+      silenceStart >= 1.0 &&
+      silenceEnd <= INTRO_SEARCH_SECONDS &&
+      silenceEnd > silenceStart
+    ) {
+      const cutTime = silenceEnd + CUT_AFTER_SILENCE_PAD;
+      console.log(`Intro cut detected: start=${silenceStart}, end=${silenceEnd}, cut=${cutTime}`);
+      return cutTime;
+    }
+  }
+
+  console.log("No suitable intro silence found. No trim.");
+  return 0;
 }
 
 app.get("/health", (req, res) => {
@@ -56,8 +110,6 @@ app.post("/merge", upload.array("files"), async (req, res) => {
 
     const processedWavs = [];
 
-    // 1. Каждый входной WAV приводим к единому виду:
-    // mono 44100, выравнивание громкости, мягкая динамика, fade edges.
     for (let i = 0; i < files.length; i++) {
       const input = files[i].path;
 
@@ -66,9 +118,15 @@ app.post("/merge", upload.array("files"), async (req, res) => {
         `part_${String(i + 1).padStart(4, "0")}.wav`
       );
 
+      const cutTime = detectIntroCutTime(input);
+
+      const inputArgs = cutTime > 0
+        ? ["-ss", String(cutTime), "-i", input]
+        : ["-i", input];
+
       runFfmpeg([
         "-y",
-        "-i", input,
+        ...inputArgs,
         "-ar", String(SAMPLE_RATE),
         "-ac", String(CHANNELS),
         "-af",
@@ -87,7 +145,6 @@ app.post("/merge", upload.array("files"), async (req, res) => {
       processedWavs.push(wav);
     }
 
-    // 2. Создаём нейтральную паузу между фрагментами
     const gapWav = path.join(workDir, "gap.wav");
 
     runFfmpeg([
@@ -99,8 +156,6 @@ app.post("/merge", upload.array("files"), async (req, res) => {
       gapWav
     ]);
 
-    // 3. Собираем concat list:
-    // part1 + gap + part2 + gap + part3...
     const concatListPath = path.join(workDir, "concat.txt");
     const concatLines = [];
 
@@ -125,7 +180,6 @@ app.post("/merge", upload.array("files"), async (req, res) => {
       mergedWav
     ]);
 
-    // 4. Финальный MP3 export
     const finalMp3 = path.join(workDir, "final.mp3");
 
     runFfmpeg([
