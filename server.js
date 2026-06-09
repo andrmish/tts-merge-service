@@ -109,15 +109,30 @@ function detectIntroCutTime(inputPath) {
   return cutTime;
 }
 
-// Download one part URL to disk.
-async function downloadToFile(url, destPath) {
-  const resp = await fetch(url);
-  if (!resp.ok) {
-    throw new Error(`Download failed (${resp.status}) for ${url}`);
+// Download one part URL to disk, with retry.
+// A 404 right after upload is usually KV cross-region propagation lag
+// (KV becomes globally consistent within ~60 s), so we back off and
+// retry rather than failing the whole chapter on a transient miss.
+async function downloadToFile(url, destPath, attempts = 6) {
+  let lastErr;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const resp = await fetch(url);
+      if (resp.ok) {
+        const buf = Buffer.from(await resp.arrayBuffer());
+        fs.writeFileSync(destPath, buf);
+        return buf.length;
+      }
+      lastErr = new Error(`Download failed (${resp.status}) for ${url}`);
+    } catch (e) {
+      lastErr = e;
+    }
+    if (attempt < attempts) {
+      // 1s, 2s, 4s, 8s, 16s → ~31 s total before giving up
+      await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+    }
   }
-  const buf = Buffer.from(await resp.arrayBuffer());
-  fs.writeFileSync(destPath, buf);
-  return buf.length;
+  throw lastErr;
 }
 
 app.get("/health", (req, res) => {
