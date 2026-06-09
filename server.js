@@ -1,12 +1,16 @@
 import express from "express";
-import multer from "multer";
 import fs from "fs";
 import path from "path";
 import os from "os";
 import { execFileSync, spawnSync } from "child_process";
 
+// Requires Node 18+ for global fetch(). Railway's default Node is fine;
+// if you pin an older version, add `import fetch from "node-fetch"`.
+
 const app = express();
-const upload = multer({ dest: os.tmpdir() });
+
+// The request body is now just a small JSON list of URLs, not the audio.
+app.use(express.json({ limit: "10mb" }));
 
 const SAMPLE_RATE = 44100;
 const CHANNELS = 1;
@@ -20,24 +24,16 @@ const FADE_SECONDS = 0.018;
 // Ожидаемая структура:
 // [Intonation bug removal test] + [первая длинная пауза в первые 5 сек] + [основной текст]
 
-// Анализируем только первые 7 секунд, чтобы поймать конец паузы,
-// но сама пауза должна НАЧАТЬСЯ в первые 5 секунд.
 const INTRO_SEARCH_SECONDS = 7.0;
-
-// Ищем первую длинную паузу, начавшуюся в первые 5 секунд
 const INTRO_PAUSE_START_MAX = 5.0;
-
-// Минимальная длительность паузы.
-// Если ElevenLabs делает паузу 1–1.5 сек, 0.45 безопасно.
 const INTRO_SILENCE_MIN = 0.45;
-
-// Порог тишины. 
-// -38dB обычно хорошо ловит TTS-паузу, но не ловит тихие согласные как silence.
 const INTRO_SILENCE_DB = "-38dB";
-
-// Сколько тишины оставить перед основным текстом.
-// Это защищает от обрезания первого слова.
 const KEEP_SILENCE_BEFORE_MAIN = 0.22;
+
+// How many parts to download in parallel (keeps total fetch time low
+// for long chapters without holding everything in memory — each part
+// is streamed to disk).
+const DOWNLOAD_CONCURRENCY = 8;
 
 function runFfmpeg(args) {
   console.log("ffmpeg", args.join(" "));
@@ -93,7 +89,6 @@ function detectIntroCutTime(inputPath) {
 
   console.log("Parsed silence events:", silenceEvents);
 
-  // Берём ПЕРВУЮ подходящую паузу, которая началась в первые 5 секунд.
   const firstIntroPause = silenceEvents.find(ev =>
     ev.start > 0.20 &&
     ev.start <= INTRO_PAUSE_START_MAX &&
@@ -105,12 +100,7 @@ function detectIntroCutTime(inputPath) {
     return 0;
   }
 
-  // Режем почти в конец этой паузы, но оставляем небольшой кусок тишины
-  // перед основным текстом, чтобы не съесть первое слово.
-  const cutTime = Math.max(
-    0,
-    firstIntroPause.end - KEEP_SILENCE_BEFORE_MAIN
-  );
+  const cutTime = Math.max(0, firstIntroPause.end - KEEP_SILENCE_BEFORE_MAIN);
 
   console.log(
     `Intro cut by FIRST pause in first 5 sec: start=${firstIntroPause.start}, end=${firstIntroPause.end}, duration=${firstIntroPause.duration}, cut=${cutTime}`
@@ -119,40 +109,73 @@ function detectIntroCutTime(inputPath) {
   return cutTime;
 }
 
+// Download one part URL to disk.
+async function downloadToFile(url, destPath) {
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    throw new Error(`Download failed (${resp.status}) for ${url}`);
+  }
+  const buf = Buffer.from(await resp.arrayBuffer());
+  fs.writeFileSync(destPath, buf);
+  return buf.length;
+}
+
 app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/merge", upload.array("files"), async (req, res) => {
+app.post("/merge", async (req, res) => {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "tts-merge-"));
 
   try {
-    const files = req.files || [];
+    const chapterId = req.body?.chapter_id;
+    let fileList = Array.isArray(req.body?.files) ? req.body.files : [];
 
-    if (!files.length) {
-      return res.status(400).json({ error: "No files uploaded" });
+    if (!fileList.length) {
+      return res.status(400).json({ error: "No files provided" });
     }
 
-    files.sort((a, b) =>
-      a.originalname.localeCompare(b.originalname, undefined, {
-        numeric: true,
-        sensitivity: "base"
-      })
-    );
+    // Sort by name (numeric) so playback order is correct, then download
+    // in that order — local filenames carry the index so on-disk order
+    // matches regardless.
+    fileList = fileList
+      .filter(f => f && f.url)
+      .sort((a, b) =>
+        String(a.name || "").localeCompare(String(b.name || ""), undefined, {
+          numeric: true,
+          sensitivity: "base"
+        })
+      );
+
+    // Download all parts to disk (bounded concurrency).
+    const localInputs = new Array(fileList.length);
+    let totalBytes = 0;
+
+    for (let start = 0; start < fileList.length; start += DOWNLOAD_CONCURRENCY) {
+      const slice = fileList.slice(start, start + DOWNLOAD_CONCURRENCY);
+
+      await Promise.all(
+        slice.map(async (f, j) => {
+          const idx = start + j;
+          const dest = path.join(
+            workDir,
+            `in_${String(idx + 1).padStart(4, "0")}.audio`
+          );
+          const size = await downloadToFile(f.url, dest);
+          totalBytes += size;
+          localInputs[idx] = dest;
+        })
+      );
+    }
 
     console.log(
-      "Received files:",
-      files.map(f => ({
-        originalname: f.originalname,
-        size: f.size,
-        mimetype: f.mimetype
-      }))
+      `Downloaded chapter=${chapterId} parts=${localInputs.length} totalBytes=${totalBytes}`
     );
 
     const processedWavs = [];
 
-    for (let i = 0; i < files.length; i++) {
-      const input = files[i].path;
+    for (let i = 0; i < localInputs.length; i++) {
+      const input = localInputs[i];
 
       const wav = path.join(
         workDir,
@@ -246,17 +269,8 @@ app.post("/merge", upload.array("files"), async (req, res) => {
     res.send(outputBuffer);
   } catch (err) {
     console.error("MERGE ERROR:", err);
-
-    res.status(500).json({
-      error: err.message
-    });
+    res.status(500).json({ error: err.message });
   } finally {
-    try {
-      for (const file of req.files || []) {
-        fs.unlinkSync(file.path);
-      }
-    } catch {}
-
     try {
       fs.rmSync(workDir, { recursive: true, force: true });
     } catch {}
@@ -264,5 +278,5 @@ app.post("/merge", upload.array("files"), async (req, res) => {
 });
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log("TTS merge service running");
+  console.log("TTS merge service running (pull mode)");
 });
