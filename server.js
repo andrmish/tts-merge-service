@@ -4,12 +4,17 @@ import path from "path";
 import os from "os";
 import { execFileSync, spawnSync } from "child_process";
 
-// Requires Node 18+ for global fetch(). Railway's default Node is fine;
-// if you pin an older version, add `import fetch from "node-fetch"`.
+// Requires Node 18+ for global fetch().
+//
+// ASYNC model: POST /merge ACKs immediately with 202 and runs the merge
+// in the BACKGROUND. When done, it POSTs the finished MP3 back to the
+// worker's result_url (or POSTs an error header on failure). This means
+// a single request is never held open for the whole merge, so big
+// chapters can no longer trip the ~100 s gateway timeout (524).
+//
+// The ffmpeg pipeline below is UNCHANGED from the synchronous version.
 
 const app = express();
-
-// The request body is now just a small JSON list of URLs, not the audio.
 app.use(express.json({ limit: "10mb" }));
 
 const SAMPLE_RATE = 44100;
@@ -23,16 +28,13 @@ const FADE_SECONDS = 0.018;
 
 // Ожидаемая структура:
 // [Intonation bug removal test] + [первая длинная пауза в первые 5 сек] + [основной текст]
-
 const INTRO_SEARCH_SECONDS = 7.0;
 const INTRO_PAUSE_START_MAX = 5.0;
 const INTRO_SILENCE_MIN = 0.45;
 const INTRO_SILENCE_DB = "-38dB";
 const KEEP_SILENCE_BEFORE_MAIN = 0.22;
 
-// How many parts to download in parallel (keeps total fetch time low
-// for long chapters without holding everything in memory — each part
-// is streamed to disk).
+// How many parts to download in parallel.
 const DOWNLOAD_CONCURRENCY = 8;
 
 function runFfmpeg(args) {
@@ -57,37 +59,28 @@ function detectIntroCutTime(inputPath) {
   const result = spawnSync("ffmpeg", args, { encoding: "utf8" });
   const output = `${result.stdout || ""}\n${result.stderr || ""}`;
 
-  console.log("silencedetect output:", output);
-
   const silenceEvents = [];
   const lines = output.split("\n");
-
   let currentStart = null;
 
   for (const line of lines) {
     const startMatch = line.match(/silence_start:\s*([0-9.]+)/);
-
     if (startMatch) {
       currentStart = Number(startMatch[1]);
       continue;
     }
-
     const endMatch = line.match(
       /silence_end:\s*([0-9.]+)\s*\|\s*silence_duration:\s*([0-9.]+)/
     );
-
     if (endMatch && currentStart !== null) {
       silenceEvents.push({
         start: currentStart,
         end: Number(endMatch[1]),
         duration: Number(endMatch[2])
       });
-
       currentStart = null;
     }
   }
-
-  console.log("Parsed silence events:", silenceEvents);
 
   const firstIntroPause = silenceEvents.find(ev =>
     ev.start > 0.20 &&
@@ -96,24 +89,20 @@ function detectIntroCutTime(inputPath) {
   );
 
   if (!firstIntroPause) {
-    console.log("No intro pause found in first 5 seconds. No trim.");
     return 0;
   }
 
   const cutTime = Math.max(0, firstIntroPause.end - KEEP_SILENCE_BEFORE_MAIN);
-
   console.log(
-    `Intro cut by FIRST pause in first 5 sec: start=${firstIntroPause.start}, end=${firstIntroPause.end}, duration=${firstIntroPause.duration}, cut=${cutTime}`
+    `chapter intro cut: start=${firstIntroPause.start} end=${firstIntroPause.end} cut=${cutTime}`
   );
-
   return cutTime;
 }
 
-// Download one part URL to disk, with retry.
-// A 404 right after upload is usually KV cross-region propagation lag
-// (KV becomes globally consistent within ~60 s), so we back off and
-// retry rather than failing the whole chapter on a transient miss.
-async function downloadToFile(url, destPath, attempts = 6) {
+// Download one part URL to disk, with retry. R2 is strongly consistent so
+// a miss is rare, but we keep a bounded retry to ride out transient hiccups.
+// Time no longer matters: the merge runs in the background.
+async function downloadToFile(url, destPath, attempts = 8) {
   let lastErr;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
@@ -128,31 +117,19 @@ async function downloadToFile(url, destPath, attempts = 6) {
       lastErr = e;
     }
     if (attempt < attempts) {
-      // 1s, 2s, 4s, 8s, 16s → ~31 s total before giving up
-      await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+      const delay = Math.min(15000, 1000 * Math.pow(2, attempt - 1));
+      await new Promise(r => setTimeout(r, delay));
     }
   }
   throw lastErr;
 }
 
-app.get("/health", (req, res) => {
-  res.json({ ok: true });
-});
-
-app.post("/merge", async (req, res) => {
+// The full merge — identical pipeline, just factored out so it can run
+// after the HTTP response has already been sent.
+async function processChapter(chapterId, fileList, resultUrl) {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "tts-merge-"));
 
   try {
-    const chapterId = req.body?.chapter_id;
-    let fileList = Array.isArray(req.body?.files) ? req.body.files : [];
-
-    if (!fileList.length) {
-      return res.status(400).json({ error: "No files provided" });
-    }
-
-    // Sort by name (numeric) so playback order is correct, then download
-    // in that order — local filenames carry the index so on-disk order
-    // matches regardless.
     fileList = fileList
       .filter(f => f && f.url)
       .sort((a, b) =>
@@ -168,14 +145,10 @@ app.post("/merge", async (req, res) => {
 
     for (let start = 0; start < fileList.length; start += DOWNLOAD_CONCURRENCY) {
       const slice = fileList.slice(start, start + DOWNLOAD_CONCURRENCY);
-
       await Promise.all(
         slice.map(async (f, j) => {
           const idx = start + j;
-          const dest = path.join(
-            workDir,
-            `in_${String(idx + 1).padStart(4, "0")}.audio`
-          );
+          const dest = path.join(workDir, `in_${String(idx + 1).padStart(4, "0")}.audio`);
           const size = await downloadToFile(f.url, dest);
           totalBytes += size;
           localInputs[idx] = dest;
@@ -183,26 +156,16 @@ app.post("/merge", async (req, res) => {
       );
     }
 
-    console.log(
-      `Downloaded chapter=${chapterId} parts=${localInputs.length} totalBytes=${totalBytes}`
-    );
+    console.log(`chapter=${chapterId} downloaded parts=${localInputs.length} bytes=${totalBytes}`);
 
     const processedWavs = [];
 
     for (let i = 0; i < localInputs.length; i++) {
       const input = localInputs[i];
-
-      const wav = path.join(
-        workDir,
-        `part_${String(i + 1).padStart(4, "0")}.wav`
-      );
+      const wav = path.join(workDir, `part_${String(i + 1).padStart(4, "0")}.wav`);
 
       const cutTime = detectIntroCutTime(input);
-
-      const inputArgs =
-        cutTime > 0
-          ? ["-ss", String(cutTime), "-i", input]
-          : ["-i", input];
+      const inputArgs = cutTime > 0 ? ["-ss", String(cutTime), "-i", input] : ["-i", input];
 
       runFfmpeg([
         "-y",
@@ -227,7 +190,6 @@ app.post("/merge", async (req, res) => {
     }
 
     const gapWav = path.join(workDir, "gap.wav");
-
     runFfmpeg([
       "-y",
       "-f", "lavfi",
@@ -239,19 +201,15 @@ app.post("/merge", async (req, res) => {
 
     const concatListPath = path.join(workDir, "concat.txt");
     const concatLines = [];
-
     for (let i = 0; i < processedWavs.length; i++) {
       concatLines.push(`file '${escapeConcatPath(processedWavs[i])}'`);
-
       if (i < processedWavs.length - 1) {
         concatLines.push(`file '${escapeConcatPath(gapWav)}'`);
       }
     }
-
     fs.writeFileSync(concatListPath, concatLines.join("\n"));
 
     const mergedWav = path.join(workDir, "merged.wav");
-
     runFfmpeg([
       "-y",
       "-f", "concat",
@@ -262,7 +220,6 @@ app.post("/merge", async (req, res) => {
     ]);
 
     const finalMp3 = path.join(workDir, "final.mp3");
-
     runFfmpeg([
       "-y",
       "-i", mergedWav,
@@ -277,21 +234,63 @@ app.post("/merge", async (req, res) => {
       finalMp3
     ]);
 
+    // Send the finished MP3 back to the worker, which stores it in R2.
     const outputBuffer = fs.readFileSync(finalMp3);
-
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Content-Disposition", "attachment; filename=merged.mp3");
-    res.send(outputBuffer);
-  } catch (err) {
-    console.error("MERGE ERROR:", err);
-    res.status(500).json({ error: err.message });
+    const resp = await fetch(resultUrl, {
+      method: "POST",
+      headers: { "Content-Type": "audio/mpeg" },
+      body: outputBuffer
+    });
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => "");
+      throw new Error(`result upload failed (${resp.status}) ${t.slice(0, 200)}`);
+    }
+    console.log(`chapter=${chapterId} result uploaded bytes=${outputBuffer.length}`);
   } finally {
-    try {
-      fs.rmSync(workDir, { recursive: true, force: true });
-    } catch {}
+    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
   }
+}
+
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+// Skip duplicate concurrent triggers for the same chapter.
+const inFlight = new Set();
+
+app.post("/merge", (req, res) => {
+  const chapterId = String(req.body?.chapter_id ?? "");
+  const fileList = Array.isArray(req.body?.files) ? req.body.files : [];
+  const resultUrl = req.body?.result_url;
+
+  if (!chapterId || !fileList.length || !resultUrl) {
+    return res.status(400).json({ error: "Missing chapter_id, files, or result_url" });
+  }
+
+  if (inFlight.has(chapterId)) {
+    return res.status(202).json({ status: "already-processing", chapter_id: chapterId });
+  }
+  inFlight.add(chapterId);
+
+  // ACK immediately — the merge runs in the background.
+  res.status(202).json({ status: "processing", chapter_id: chapterId, parts: fileList.length });
+
+  processChapter(chapterId, fileList, resultUrl)
+    .catch(async err => {
+      console.error("MERGE ERROR (bg):", err);
+      try {
+        await fetch(resultUrl, {
+          method: "POST",
+          headers: {
+            "X-Merge-Status": "error",
+            "X-Merge-Error": String(err?.message || err).slice(0, 400)
+          }
+        });
+      } catch (e) {
+        console.error("failed to report error to worker:", e);
+      }
+    })
+    .finally(() => inFlight.delete(chapterId));
 });
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log("TTS merge service running (pull mode)");
+  console.log("TTS merge service running (async mode)");
 });
