@@ -7,8 +7,9 @@ WORKDIR /app
 COPY package.json .
 RUN npm install
 
-COPY server.js .
+COPY server.js merge-audio.mjs audio-qa.mjs ./
 
 EXPOSE 3000
 
 CMD ["npm", "start"]
+

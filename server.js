@@ -2,7 +2,8 @@ import express from "express";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { execFileSync, spawnSync } from "child_process";
+import { spawnSync } from "child_process";
+import {mergeAudio,MERGE_VERSION} from "./merge-audio.mjs";
 
 // Requires Node 18+ for global fetch().
 //
@@ -13,14 +14,8 @@ import { execFileSync, spawnSync } from "child_process";
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-const SAMPLE_RATE = 44100;
-const CHANNELS = 1;
-
 // Пауза между очищенными фрагментами
 const GAP_SECONDS = 0.3;
-
-// Мягкие края
-const FADE_SECONDS = 0.018;
 
 // Поиск служебной фразы и первой паузы
 const INTRO_SEARCH_SECONDS = 7.0;
@@ -40,18 +35,6 @@ const ERROR_REPORT_ATTEMPTS = 3;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function runFfmpeg(args) {
-  console.log("ffmpeg", args.join(" "));
-
-  execFileSync("ffmpeg", args, {
-    stdio: "inherit"
-  });
-}
-
-function escapeConcatPath(filePath) {
-  return filePath.replace(/'/g, "'\\''");
 }
 
 function detectIntroCutTime(inputPath) {
@@ -307,8 +290,10 @@ async function processChapter(chapterId, fileList, resultUrl) {
   );
 
   try {
+    if (fileList.some(file => !file || !file.url)) throw new Error("Invalid source file; refusing to silently omit a part");
+    const names=fileList.map(file => file.name).filter(Boolean);
+    if (new Set(names).size !== names.length) throw new Error("Duplicate source filenames");
     fileList = fileList
-      .filter(file => file && file.url)
       .sort((a, b) =>
         String(a.name || "").localeCompare(
           String(b.name || ""),
@@ -363,127 +348,12 @@ async function processChapter(chapterId, fileList, resultUrl) {
         `parts=${localInputs.length} bytes=${totalBytes}`
     );
 
-    const processedWavs = [];
-
-    // Обрабатываем каждую часть
-    for (let index = 0; index < localInputs.length; index++) {
-      const input = localInputs[index];
-
-      const outputWav = path.join(
-        workDir,
-        `part_${String(index + 1).padStart(4, "0")}.wav`
-      );
-
-      const cutTime = detectIntroCutTime(input);
-
-      const inputArgs =
-        cutTime > 0
-          ? ["-ss", String(cutTime), "-i", input]
-          : ["-i", input];
-
-      runFfmpeg([
-        "-y",
-        ...inputArgs,
-        "-ar",
-        String(SAMPLE_RATE),
-        "-ac",
-        String(CHANNELS),
-        "-af",
-        [
-          "loudnorm=I=-20:TP=-3:LRA=8",
-          "acompressor=threshold=-22dB:ratio=1.15:attack=35:release=220",
-          "alimiter=limit=0.92",
-          `afade=t=in:st=0:d=${FADE_SECONDS}`,
-          "areverse",
-          `afade=t=in:st=0:d=${FADE_SECONDS}`,
-          "areverse"
-        ].join(","),
-        outputWav
-      ]);
-
-      processedWavs.push(outputWav);
-    }
-
-    // Создаём паузу между частями
-    const gapWav = path.join(workDir, "gap.wav");
-
-    runFfmpeg([
-      "-y",
-      "-f",
-      "lavfi",
-      "-i",
-      `anullsrc=r=${SAMPLE_RATE}:cl=mono:d=${GAP_SECONDS}`,
-      "-ar",
-      String(SAMPLE_RATE),
-      "-ac",
-      String(CHANNELS),
-      gapWav
-    ]);
-
-    // Создаём список для concat
-    const concatListPath = path.join(
-      workDir,
-      "concat.txt"
-    );
-
-    const concatLines = [];
-
-    for (
-      let index = 0;
-      index < processedWavs.length;
-      index++
-    ) {
-      concatLines.push(
-        `file '${escapeConcatPath(processedWavs[index])}'`
-      );
-
-      if (index < processedWavs.length - 1) {
-        concatLines.push(
-          `file '${escapeConcatPath(gapWav)}'`
-        );
-      }
-    }
-
-    fs.writeFileSync(
-      concatListPath,
-      concatLines.join("\n")
-    );
-
-    // Склеиваем WAV
-    const mergedWav = path.join(workDir, "merged.wav");
-
-    runFfmpeg([
-      "-y",
-      "-f",
-      "concat",
-      "-safe",
-      "0",
-      "-i",
-      concatListPath,
-      "-c",
-      "copy",
-      mergedWav
-    ]);
-
-    // Создаём финальный MP3
-    const finalMp3 = path.join(workDir, "final.mp3");
-
-    runFfmpeg([
-      "-y",
-      "-i",
-      mergedWav,
-      "-af",
-      [
-        "acompressor=threshold=-20dB:ratio=1.12:attack=35:release=240",
-        "loudnorm=I=-16:TP=-1.5:LRA=9",
-        "alimiter=limit=0.95"
-      ].join(","),
-      "-codec:a",
-      "libmp3lame",
-      "-b:a",
-      "192k",
-      finalMp3
-    ]);
+    const cutTimes = localInputs.map(detectIntroCutTime);
+    const merged = mergeAudio(localInputs, {workDir, cutTimes, gapSeconds:GAP_SECONDS});
+    const finalMp3 = merged.mp3;
+    console.log(JSON.stringify({event:"audio_qa",chapter_id:chapterId,...merged.qa,
+      expected_count_verified:false,
+      source_names:fileList.map(file => String(file.name || ""))}));
 
     if (!fs.existsSync(finalMp3)) {
       throw new Error("Final MP3 was not created");
@@ -518,7 +388,11 @@ async function processChapter(chapterId, fileList, resultUrl) {
 
 app.get("/health", (req, res) => {
   res.json({
-    ok: true
+    ok: true,
+    merge_version: MERGE_VERSION,
+    audio_processing: "preserve-dynamics",
+    output_format: "mp3",
+    assembly_qa: true
   });
 });
 
@@ -578,6 +452,7 @@ app.post("/merge", (req, res) => {
 
 app.listen(process.env.PORT || 3000, () => {
   console.log(
-    "TTS merge service running (async mode with result upload retry)"
+    "TTS merge service running (preserve-dynamics, PCM integrity QA, MP3 callback)"
   );
 });
+
